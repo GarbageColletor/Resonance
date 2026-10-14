@@ -1,0 +1,6 @@
+{
+  "_comment": "Copia este archivo a resonance.dev.json (ya ignorado por git) y rellena tus datos. El spike nativo lo lee al arrancar. Usa auth por token Subsonic: nunca se guarda la contraseña en claro más allá de este archivo local.",
+  "serverUrl": "https://tu-navidrome.ejemplo.com",
+  "username": "tu-usuario",
+  "password": "tu-contraseña"
+}

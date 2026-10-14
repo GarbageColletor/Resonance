@@ -1,0 +1,140 @@
+:root {
+    --bg: #171a1d;
+    --surface: #20252a;
+    --surface-raised: #293039;
+    --border: #343d45;
+    --text-primary: #e5e8e8;
+    --text-muted: #a7b0b4;
+    --accent: #88a99b;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.app {
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 32px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+h1 {
+    margin: 0;
+    font-size: 28px;
+    letter-spacing: 0.5px;
+}
+
+.tag {
+    font-size: 12px;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+}
+
+.server {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.player {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.now .title {
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.now .sub {
+    color: var(--text-muted);
+    font-size: 14px;
+    margin-top: 2px;
+}
+
+.seekrow {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.time {
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--text-muted);
+    min-width: 42px;
+    text-align: center;
+}
+
+input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.controls {
+    display: flex;
+    gap: 12px;
+}
+
+button {
+    background: var(--surface-raised);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 150ms ease, border-color 150ms ease;
+}
+
+button:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+button.primary {
+    background: var(--accent);
+    color: #10140f;
+    border-color: var(--accent);
+    font-weight: 600;
+}
+
+.error {
+    color: #d98b8b;
+    font-size: 14px;
+    margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    button {
+        transition: none;
+    }
+}

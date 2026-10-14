@@ -5,13 +5,14 @@ pub mod subsonic;
 use std::sync::Mutex;
 
 use audio::{AudioHandle, Cmd, PlayerState};
-use subsonic::Subsonic;
+use subsonic::{Song, Subsonic};
 
 const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../resonance.dev.json");
 
 struct AppState {
     sub: Mutex<Option<Subsonic>>,
     audio: AudioHandle,
+    last: Mutex<Option<(String, Song)>>,
 }
 
 #[derive(serde::Serialize)]
@@ -59,8 +60,22 @@ fn play_random(state: tauri::State<AppState>) -> Result<SongDto, String> {
         album: song.album.clone(),
         duration_secs: song.duration_secs,
     };
+    *state.last.lock().unwrap() = Some((url.clone(), song.clone()));
     state.audio.send(Cmd::Play { url, song });
     Ok(dto)
+}
+
+#[tauri::command]
+fn replay(state: tauri::State<AppState>) -> Result<(), String> {
+    let (url, song) = state
+        .last
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or("no hay pista para repetir")?
+        .clone();
+    state.audio.send(Cmd::Play { url, song });
+    Ok(())
 }
 
 #[tauri::command]
@@ -88,6 +103,7 @@ pub fn run() {
     let app_state = AppState {
         sub: Mutex::new(None),
         audio: AudioHandle::spawn(),
+        last: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -96,6 +112,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connect,
             play_random,
+            replay,
             toggle_play,
             seek,
             set_volume,

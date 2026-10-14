@@ -19,6 +19,7 @@ type SongDto = {
 
 type PlayerState = {
     playing: boolean;
+    ended: boolean;
     position_secs: number;
     duration_secs: number;
     title: string | null;
@@ -37,20 +38,39 @@ export default function App() {
     const [conn, setConn] = useState<ConnectInfo | null>(null);
     const [song, setSong] = useState<SongDto | null>(null);
     const [player, setPlayer] = useState<PlayerState | null>(null);
+    const [uiPlaying, setUiPlaying] = useState(false);
+    const [dragPos, setDragPos] = useState(0);
+    const [, forceRender] = useState(0);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const dragging = useRef(false);
-    const [dragPos, setDragPos] = useState(0);
+    const actionAt = useRef(0);
+    const pendingSeek = useRef<number | null>(null);
+    const pendingSince = useRef(0);
+    const lastTitle = useRef<string | null>(null);
 
     useEffect(() => {
         const id = setInterval(async () => {
             try {
                 const st = await invoke<PlayerState>("player_state");
                 setPlayer(st);
+                if ((st.title ?? null) !== lastTitle.current) {
+                    lastTitle.current = st.title ?? null;
+                    dragging.current = false;
+                    pendingSeek.current = null;
+                }
+                if (Date.now() - actionAt.current > 500) {
+                    setUiPlaying(st.playing);
+                }
+                if (pendingSeek.current !== null) {
+                    const reached = Math.abs(st.position_secs - pendingSeek.current) < 1.0;
+                    const expired = Date.now() - pendingSince.current > 1500;
+                    if (reached || expired) pendingSeek.current = null;
+                }
             } catch {
             }
-        }, 250);
+        }, 200);
         return () => clearInterval(id);
     }, []);
 
@@ -71,13 +91,35 @@ export default function App() {
         run(async () => setConn(await invoke<ConnectInfo>("connect")));
 
     const playRandom = () =>
-        run(async () => setSong(await invoke<SongDto>("play_random")));
+        run(async () => {
+            const s = await invoke<SongDto>("play_random");
+            setSong(s);
+            dragging.current = false;
+            pendingSeek.current = null;
+            actionAt.current = Date.now();
+            setUiPlaying(true);
+        });
 
-    const toggle = () => invoke("toggle_play");
+    const toggle = () => {
+        setUiPlaying((p) => !p);
+        actionAt.current = Date.now();
+        invoke("toggle_play");
+    };
 
+    const replay = () => {
+        pendingSeek.current = null;
+        actionAt.current = Date.now();
+        setUiPlaying(true);
+        invoke("replay");
+    };
+
+    const ended = player?.ended ?? false;
     const duration = player?.duration_secs || song?.duration_secs || 0;
-    const position = dragging.current ? dragPos : player?.position_secs || 0;
-    const playing = player?.playing ?? false;
+    const position = dragging.current
+        ? dragPos
+        : pendingSeek.current !== null
+            ? pendingSeek.current
+            : player?.position_secs || 0;
 
     return (
         <main className="app">
@@ -88,7 +130,7 @@ export default function App() {
 
             {!conn ? (
                 <button className="primary" onClick={connect} disabled={busy}>
-                    {busy ? "Conectando…" : "Conectar a Navidrome"}
+                    {busy ? "Conectando..." : "Conectar a Navidrome"}
                 </button>
             ) : (
                 <p className="server">
@@ -116,21 +158,33 @@ export default function App() {
                             max={Math.max(duration, 1)}
                             step={0.5}
                             value={Math.min(position, duration || position)}
-                            disabled={!song}
-                            onPointerDown={() => (dragging.current = true)}
+                            disabled={!song || ended}
+                            onPointerDown={() => {
+                                dragging.current = true;
+                                forceRender((n) => n + 1);
+                            }}
                             onChange={(e) => setDragPos(parseFloat(e.target.value))}
                             onPointerUp={(e) => {
                                 const secs = parseFloat((e.target as HTMLInputElement).value);
                                 dragging.current = false;
+                                pendingSeek.current = secs;
+                                pendingSince.current = Date.now();
+                                actionAt.current = Date.now();
                                 invoke("seek", {secs});
+                            }}
+                            onPointerCancel={() => {
+                                dragging.current = false;
+                            }}
+                            onLostPointerCapture={() => {
+                                dragging.current = false;
                             }}
                         />
                         <span className="time">{fmt(duration)}</span>
                     </div>
 
                     <div className="controls">
-                        <button onClick={() => toggle()} disabled={!song}>
-                            {playing ? "Pausa" : "Play"}
+                        <button onClick={ended ? replay : toggle} disabled={!song}>
+                            {!uiPlaying || ended ? "Play" : "Pausa"}
                         </button>
                         <button className="primary" onClick={playRandom} disabled={busy}>
                             Pista aleatoria

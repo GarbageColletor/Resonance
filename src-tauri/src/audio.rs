@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rodio::source::SeekError;
@@ -21,9 +22,13 @@ use symphonia::core::units::Time;
 use crate::http_source::HttpStream;
 use crate::subsonic::Song;
 
+const QUEUE_CAP: usize = 44_100 * 2 * 4;
+const DRAIN_CHUNK: usize = 4096;
+
 #[derive(Clone, Default, serde::Serialize)]
 pub struct PlayerState {
     pub playing: bool,
+    pub ended: bool,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub title: Option<String>,
@@ -122,6 +127,7 @@ fn handle_cmd(
                 {
                     let mut st = state.lock().unwrap();
                     st.playing = true;
+                    st.ended = false;
                     st.position_secs = 0.0;
                     st.duration_secs = song.duration_secs.unwrap_or(0) as f64;
                     st.title = Some(song.title.clone());
@@ -213,9 +219,14 @@ fn tick_state(
         let mut st = state.lock().unwrap();
         if ended {
             st.playing = false;
+            st.ended = true;
+            if st.duration_secs > 0.0 {
+                st.position_secs = st.duration_secs;
+            }
         } else {
             st.position_secs = pos;
             st.playing = !paused;
+            st.ended = false;
         }
     }
 
@@ -286,104 +297,166 @@ fn make_controls(tx: Sender<Cmd>) -> Option<MediaControls> {
     Some(controls)
 }
 
-fn build_source(client: &reqwest::blocking::Client, url: &str) -> Result<SymphoniaSource, String> {
-    let stream = HttpStream::new(client.clone(), url.to_string()).map_err(|e| e.to_string())?;
-    SymphoniaSource::new(stream)
+struct QueueInner {
+    buf: VecDeque<f32>,
+    eof: bool,
+    seek_to: Option<f64>,
+    stop: bool,
 }
 
-struct SymphoniaSource {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track_id: u32,
-    sample_rate: u32,
-    channels: u16,
-    total: Option<Duration>,
-    buf: Vec<f32>,
-    pos: usize,
+struct SampleQueue {
+    inner: Mutex<QueueInner>,
+    cv: Condvar,
 }
 
-impl SymphoniaSource {
-    fn new(stream: HttpStream) -> Result<Self, String> {
-        let mss = MediaSourceStream::new(Box::new(stream), Default::default());
-        let mut hint = Hint::new();
-        hint.with_extension("flac");
-
-        let probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            )
-            .map_err(|e| format!("probe: {e}"))?;
-        let format = probed.format;
-
-        let track = format.default_track().ok_or("sin pista de audio")?;
-        let track_id = track.id;
-        let params = track.codec_params.clone();
-
-        let sample_rate = params.sample_rate.unwrap_or(44_100);
-        let channels = params.channels.map(|c| c.count() as u16).unwrap_or(2);
-        let total = match (params.n_frames, params.sample_rate) {
-            (Some(frames), Some(sr)) if sr > 0 => {
-                Some(Duration::from_secs_f64(frames as f64 / sr as f64))
-            }
-            _ => None,
-        };
-
-        let decoder = symphonia::default::get_codecs()
-            .make(&params, &DecoderOptions::default())
-            .map_err(|e| format!("decoder: {e}"))?;
-
-        Ok(Self {
-            format,
-            decoder,
-            track_id,
-            sample_rate,
-            channels,
-            total,
-            buf: Vec::new(),
-            pos: 0,
+impl SampleQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(QueueInner {
+                buf: VecDeque::new(),
+                eof: false,
+                seek_to: None,
+                stop: false,
+            }),
+            cv: Condvar::new(),
         })
     }
 }
 
-impl Iterator for SymphoniaSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
-        loop {
-            if self.pos < self.buf.len() {
-                let s = self.buf[self.pos];
-                self.pos += 1;
-                return Some(s);
+fn produce(
+    queue: Arc<SampleQueue>,
+    mut format: Box<dyn FormatReader>,
+    mut decoder: Box<dyn Decoder>,
+    track_id: u32,
+) {
+    loop {
+        {
+            let mut g = queue.inner.lock().unwrap();
+            if g.stop {
+                return;
             }
-            let packet = match self.format.next_packet() {
-                Ok(p) => p,
-                Err(_) => return None,
-            };
-            if packet.track_id() != self.track_id {
+            if let Some(t) = g.seek_to.take() {
+                drop(g);
+                let _ = format.seek(
+                    SeekMode::Accurate,
+                    SeekTo::Time {
+                        time: Time::from(t),
+                        track_id: Some(track_id),
+                    },
+                );
+                decoder.reset();
+                let mut g2 = queue.inner.lock().unwrap();
+                g2.buf.clear();
+                g2.eof = false;
                 continue;
             }
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let spec = *decoded.spec();
-                    let capacity = decoded.capacity() as u64;
-                    let mut sb = SampleBuffer::<f32>::new(capacity, spec);
-                    sb.copy_interleaved_ref(decoded);
-                    self.buf = sb.samples().to_vec();
-                    self.pos = 0;
-                }
-                Err(SymError::DecodeError(_)) => continue,
-                Err(_) => return None,
-            }
         }
+
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => {
+                park_until_seek_or_stop(&queue);
+                continue;
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let samples = match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                let cap = decoded.capacity() as u64;
+                let mut sb = SampleBuffer::<f32>::new(cap, spec);
+                sb.copy_interleaved_ref(decoded);
+                sb.samples().to_vec()
+            }
+            Err(SymError::DecodeError(_)) => continue,
+            Err(_) => {
+                park_until_seek_or_stop(&queue);
+                continue;
+            }
+        };
+
+        let mut g = queue.inner.lock().unwrap();
+        loop {
+            if g.stop {
+                return;
+            }
+            if g.seek_to.is_some() {
+                break;
+            }
+            if g.buf.len() + samples.len() <= QUEUE_CAP {
+                break;
+            }
+            g = queue.cv.wait(g).unwrap();
+        }
+        if g.stop {
+            return;
+        }
+        if g.seek_to.is_some() {
+            continue;
+        }
+        g.buf.extend(samples);
+        queue.cv.notify_all();
     }
 }
 
-impl Source for SymphoniaSource {
+fn park_until_seek_or_stop(queue: &Arc<SampleQueue>) {
+    let mut g = queue.inner.lock().unwrap();
+    g.eof = true;
+    while g.seek_to.is_none() && !g.stop {
+        g = queue.cv.wait(g).unwrap();
+    }
+}
+
+struct StreamingSource {
+    queue: Arc<SampleQueue>,
+    local: Vec<f32>,
+    lpos: usize,
+    sample_rate: u32,
+    channels: u16,
+    total: Option<Duration>,
+    ended: bool,
+}
+
+impl Iterator for StreamingSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.lpos < self.local.len() {
+            let s = self.local[self.lpos];
+            self.lpos += 1;
+            return Some(s);
+        }
+        if self.ended {
+            return None;
+        }
+
+        let mut g = self.queue.inner.lock().unwrap();
+        let n = DRAIN_CHUNK.min(g.buf.len());
+        if n == 0 {
+            if g.eof {
+                drop(g);
+                self.ended = true;
+                return None;
+            }
+            drop(g);
+            self.local = vec![0.0; DRAIN_CHUNK];
+            self.lpos = 1;
+            return Some(0.0);
+        }
+        self.local = g.buf.drain(..n).collect();
+        drop(g);
+        self.queue.cv.notify_all();
+        self.lpos = 1;
+        Some(self.local[0])
+    }
+}
+
+impl Source for StreamingSource {
     fn current_frame_len(&self) -> Option<usize> {
-        let left = self.buf.len().saturating_sub(self.pos);
+        let left = self.local.len().saturating_sub(self.lpos);
         if left > 0 {
             Some(left)
         } else {
@@ -404,23 +477,75 @@ impl Source for SymphoniaSource {
     }
 
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
-        self.format
-            .seek(
-                SeekMode::Accurate,
-                SeekTo::Time {
-                    time: Time::from(pos.as_secs_f64()),
-                    track_id: Some(self.track_id),
-                },
-            )
-            .map_err(|e| {
-                SeekError::Other(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
-            })?;
-        self.decoder.reset();
-        self.buf.clear();
-        self.pos = 0;
+        {
+            let mut g = self.queue.inner.lock().unwrap();
+            g.buf.clear();
+            g.seek_to = Some(pos.as_secs_f64());
+            g.eof = false;
+        }
+        self.queue.cv.notify_all();
+        self.local.clear();
+        self.lpos = 0;
+        self.ended = false;
         Ok(())
     }
+}
+
+impl Drop for StreamingSource {
+    fn drop(&mut self) {
+        {
+            let mut g = self.queue.inner.lock().unwrap();
+            g.stop = true;
+        }
+        self.queue.cv.notify_all();
+    }
+}
+
+fn build_source(client: &reqwest::blocking::Client, url: &str) -> Result<StreamingSource, String> {
+    let stream = HttpStream::new(client.clone(), url.to_string()).map_err(|e| e.to_string())?;
+    let mss = MediaSourceStream::new(Box::new(stream), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("probe: {e}"))?;
+    let format = probed.format;
+
+    let track = format.default_track().ok_or("sin pista de audio")?;
+    let track_id = track.id;
+    let params = track.codec_params.clone();
+
+    let sample_rate = params.sample_rate.unwrap_or(44_100);
+    let channels = params.channels.map(|c| c.count() as u16).unwrap_or(2);
+    let total = match (params.n_frames, params.sample_rate) {
+        (Some(frames), Some(sr)) if sr > 0 => Some(Duration::from_secs_f64(frames as f64 / sr as f64)),
+        _ => None,
+    };
+
+    let decoder = symphonia::default::get_codecs()
+        .make(&params, &DecoderOptions::default())
+        .map_err(|e| format!("decoder: {e}"))?;
+
+    let queue = SampleQueue::new();
+    let producer_queue = Arc::clone(&queue);
+    std::thread::Builder::new()
+        .name("resonance-decode".into())
+        .spawn(move || produce(producer_queue, format, decoder, track_id))
+        .map_err(|e| e.to_string())?;
+
+    Ok(StreamingSource {
+        queue,
+        local: Vec::new(),
+        lpos: 0,
+        sample_rate,
+        channels,
+        total,
+        ended: false,
+    })
 }

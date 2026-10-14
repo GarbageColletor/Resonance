@@ -19,7 +19,7 @@ pub struct Subsonic {
     pub client: Client,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Song {
     pub id: String,
     pub title: String,
@@ -27,6 +27,22 @@ pub struct Song {
     pub album: Option<String>,
     pub suffix: Option<String>,
     pub duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    pub album_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Album {
+    pub id: String,
+    pub name: String,
+    pub artist: Option<String>,
+    pub year: Option<u64>,
+    pub song_count: Option<u64>,
 }
 
 impl Subsonic {
@@ -40,13 +56,21 @@ impl Subsonic {
             .build()
             .map_err(to_io)?;
         let base = cfg.server_url.trim_end_matches('/').to_string();
-        Ok(Self { base, user: cfg.username, password: cfg.password, client })
+        Ok(Self {
+            base,
+            user: cfg.username,
+            password: cfg.password,
+            client,
+        })
     }
 
     fn auth_query(&self) -> String {
         let salt = format!(
             "{:x}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         );
         let token = format!("{:x}", md5::compute(format!("{}{}", self.password, salt)));
         format!(
@@ -72,7 +96,9 @@ impl Subsonic {
         let v: serde_json::Value = resp.json().map_err(to_io)?;
         let sr = &v["subsonic-response"];
         if sr["status"] != "ok" {
-            let msg = sr["error"]["message"].as_str().unwrap_or("error desconocido");
+            let msg = sr["error"]["message"]
+                .as_str()
+                .unwrap_or("error desconocido");
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("subsonic error: {msg}"),
@@ -117,18 +143,73 @@ impl Subsonic {
                 "getRandomSongs no devolvio canciones",
             ));
         }
-        Ok(Song {
-            id: s["id"].as_str().unwrap_or("").to_string(),
-            title: s["title"].as_str().unwrap_or("(sin titulo)").to_string(),
-            artist: s["artist"].as_str().map(str::to_string),
-            album: s["album"].as_str().map(str::to_string),
-            suffix: s["suffix"].as_str().map(str::to_string),
-            duration_secs: s["duration"].as_u64(),
-        })
+        Ok(song_from(s))
+    }
+
+    pub fn artists_full(&self) -> io::Result<Vec<Artist>> {
+        let v = self.get_json("getArtists", "")?;
+        let mut out = Vec::new();
+        if let Some(index) = v["subsonic-response"]["artists"]["index"].as_array() {
+            for idx in index {
+                if let Some(arr) = idx["artist"].as_array() {
+                    for a in arr {
+                        if let Some(id) = a["id"].as_str() {
+                            out.push(Artist {
+                                id: id.to_string(),
+                                name: a["name"].as_str().unwrap_or("(sin nombre)").to_string(),
+                                album_count: a["albumCount"].as_u64(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn artist_albums(&self, id: &str) -> io::Result<Vec<Album>> {
+        let v = self.get_json("getArtist", &format!("id={}", url_encode(id)))?;
+        let mut out = Vec::new();
+        if let Some(arr) = v["subsonic-response"]["artist"]["album"].as_array() {
+            for a in arr {
+                if let Some(aid) = a["id"].as_str() {
+                    out.push(Album {
+                        id: aid.to_string(),
+                        name: a["name"].as_str().unwrap_or("(sin titulo)").to_string(),
+                        artist: a["artist"].as_str().map(str::to_string),
+                        year: a["year"].as_u64(),
+                        song_count: a["songCount"].as_u64(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn album_tracks(&self, id: &str) -> io::Result<Vec<Song>> {
+        let v = self.get_json("getAlbum", &format!("id={}", url_encode(id)))?;
+        let mut out = Vec::new();
+        if let Some(arr) = v["subsonic-response"]["album"]["song"].as_array() {
+            for s in arr {
+                out.push(song_from(s));
+            }
+        }
+        Ok(out)
     }
 
     pub fn stream_url(&self, id: &str) -> String {
         self.rest_url("stream", &format!("id={}", url_encode(id)))
+    }
+}
+
+fn song_from(s: &serde_json::Value) -> Song {
+    Song {
+        id: s["id"].as_str().unwrap_or("").to_string(),
+        title: s["title"].as_str().unwrap_or("(sin titulo)").to_string(),
+        artist: s["artist"].as_str().map(str::to_string),
+        album: s["album"].as_str().map(str::to_string),
+        suffix: s["suffix"].as_str().map(str::to_string),
+        duration_secs: s["duration"].as_u64(),
     }
 }
 

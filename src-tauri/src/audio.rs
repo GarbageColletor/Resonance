@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rodio::source::SeekError;
-use rodio::{OutputStream, Sink, Source};
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
@@ -29,15 +29,24 @@ const DRAIN_CHUNK: usize = 4096;
 pub struct PlayerState {
     pub playing: bool,
     pub ended: bool,
+    pub has_next: bool,
+    pub has_prev: bool,
     pub position_secs: f64,
     pub duration_secs: f64,
+    pub current_id: Option<String>,
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
 }
 
 pub enum Cmd {
-    Play { url: String, song: Song },
+    PlayQueue {
+        items: Vec<(String, Song)>,
+        start: usize,
+    },
+    Next,
+    Prev,
+    Replay,
     Pause,
     Resume,
     Toggle,
@@ -88,54 +97,154 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         .build()
         .expect("http client");
 
-    let mut sink: Option<Sink> = None;
-    let mut controls = make_controls(tx_self);
-    let mut last_progress_push = Instant::now();
+    let mut engine = Engine {
+        handle,
+        client,
+        state,
+        controls: make_controls(tx_self),
+        sink: None,
+        queue: Vec::new(),
+        index: 0,
+        volume: 1.0,
+        last_push: Instant::now(),
+    };
 
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(cmd) => handle_cmd(cmd, &client, &handle, &mut sink, &mut controls, &state),
+            Ok(cmd) => engine.handle(cmd),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        tick_state(&sink, &state, &mut controls, &mut last_progress_push);
+        engine.tick();
     }
 }
 
-fn handle_cmd(
-    cmd: Cmd,
-    client: &reqwest::blocking::Client,
-    handle: &rodio::OutputStreamHandle,
-    sink: &mut Option<Sink>,
-    controls: &mut Option<MediaControls>,
-    state: &Arc<Mutex<PlayerState>>,
-) {
-    match cmd {
-        Cmd::Play { url, song } => match build_source(client, &url) {
+struct Engine {
+    handle: OutputStreamHandle,
+    client: reqwest::blocking::Client,
+    state: Arc<Mutex<PlayerState>>,
+    controls: Option<MediaControls>,
+    sink: Option<Sink>,
+    queue: Vec<(String, Song)>,
+    index: usize,
+    volume: f32,
+    last_push: Instant,
+}
+
+impl Engine {
+    fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::PlayQueue { items, start } => {
+                if items.is_empty() {
+                    return;
+                }
+                self.queue = items;
+                let start = start.min(self.queue.len() - 1);
+                self.start_at(start);
+            }
+            Cmd::Next => {
+                if self.index + 1 < self.queue.len() {
+                    self.start_at(self.index + 1);
+                }
+            }
+            Cmd::Prev => {
+                if self.index > 0 {
+                    self.start_at(self.index - 1);
+                }
+            }
+            Cmd::Replay => {
+                if !self.queue.is_empty() {
+                    self.start_at(self.index);
+                }
+            }
+            Cmd::Pause => {
+                if let Some(s) = self.sink.as_ref() {
+                    s.pause();
+                }
+                self.state.lock().unwrap().playing = false;
+                self.push_playback(false);
+            }
+            Cmd::Resume => {
+                if let Some(s) = self.sink.as_ref() {
+                    s.play();
+                }
+                self.state.lock().unwrap().playing = true;
+                self.push_playback(true);
+            }
+            Cmd::Toggle => {
+                if let Some(s) = self.sink.as_ref() {
+                    let now_playing = if s.is_paused() {
+                        s.play();
+                        true
+                    } else {
+                        s.pause();
+                        false
+                    };
+                    self.state.lock().unwrap().playing = now_playing;
+                    self.push_playback(now_playing);
+                }
+            }
+            Cmd::SeekTo(secs) => {
+                if let Some(s) = self.sink.as_ref() {
+                    match s.try_seek(Duration::from_secs_f64(secs.max(0.0))) {
+                        Ok(()) => self.state.lock().unwrap().position_secs = secs,
+                        Err(e) => eprintln!("[audio] seek fallo: {e}"),
+                    }
+                }
+            }
+            Cmd::Stop => {
+                self.sink = None;
+                self.queue.clear();
+                self.index = 0;
+                *self.state.lock().unwrap() = PlayerState::default();
+                if let Some(c) = self.controls.as_mut() {
+                    let _ = c.set_playback(MediaPlayback::Stopped);
+                }
+            }
+            Cmd::SetVolume(v) => {
+                self.volume = v.clamp(0.0, 2.0);
+                if let Some(s) = self.sink.as_ref() {
+                    s.set_volume(self.volume);
+                }
+            }
+        }
+    }
+
+    fn start_at(&mut self, idx: usize) {
+        if idx >= self.queue.len() {
+            return;
+        }
+        let (url, song) = self.queue[idx].clone();
+        match build_source(&self.client, &url) {
             Ok(source) => {
-                let new_sink = match Sink::try_new(handle) {
+                let new_sink = match Sink::try_new(&self.handle) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("[audio] no pude crear sink: {e}");
                         return;
                     }
                 };
+                new_sink.set_volume(self.volume);
                 new_sink.append(source);
                 new_sink.play();
-                *sink = Some(new_sink);
+                self.sink = Some(new_sink);
+                self.index = idx;
 
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = self.state.lock().unwrap();
                     st.playing = true;
                     st.ended = false;
                     st.position_secs = 0.0;
                     st.duration_secs = song.duration_secs.unwrap_or(0) as f64;
+                    st.current_id = Some(song.id.clone());
                     st.title = Some(song.title.clone());
                     st.artist = song.artist.clone();
                     st.album = song.album.clone();
+                    st.has_next = idx + 1 < self.queue.len();
+                    st.has_prev = idx > 0;
                 }
 
-                if let Some(c) = controls.as_mut() {
+                if let Some(c) = self.controls.as_mut() {
                     let _ = c.set_metadata(MediaMetadata {
                         title: Some(&song.title),
                         artist: song.artist.as_deref(),
@@ -149,119 +258,65 @@ fn handle_cmd(
                 }
             }
             Err(e) => eprintln!("[audio] fallo al abrir {}: {e}", song.title),
-        },
-        Cmd::Pause => {
-            if let Some(s) = sink.as_ref() {
-                s.pause();
-            }
-            set_playing(state, false);
-            set_control_playback(controls, state, false);
-        }
-        Cmd::Resume => {
-            if let Some(s) = sink.as_ref() {
-                s.play();
-            }
-            set_playing(state, true);
-            set_control_playback(controls, state, true);
-        }
-        Cmd::Toggle => {
-            if let Some(s) = sink.as_ref() {
-                let now_playing = if s.is_paused() {
-                    s.play();
-                    true
-                } else {
-                    s.pause();
-                    false
-                };
-                set_playing(state, now_playing);
-                set_control_playback(controls, state, now_playing);
-            }
-        }
-        Cmd::SeekTo(secs) => {
-            if let Some(s) = sink.as_ref() {
-                match s.try_seek(Duration::from_secs_f64(secs.max(0.0))) {
-                    Ok(()) => state.lock().unwrap().position_secs = secs,
-                    Err(e) => eprintln!("[audio] seek fallo: {e}"),
-                }
-            }
-        }
-        Cmd::Stop => {
-            *sink = None;
-            {
-                let mut st = state.lock().unwrap();
-                *st = PlayerState::default();
-            }
-            if let Some(c) = controls.as_mut() {
-                let _ = c.set_playback(MediaPlayback::Stopped);
-            }
-        }
-        Cmd::SetVolume(v) => {
-            if let Some(s) = sink.as_ref() {
-                s.set_volume(v.clamp(0.0, 2.0));
-            }
         }
     }
-}
 
-fn tick_state(
-    sink: &Option<Sink>,
-    state: &Arc<Mutex<PlayerState>>,
-    controls: &mut Option<MediaControls>,
-    last_progress_push: &mut Instant,
-) {
-    let Some(s) = sink.as_ref() else { return };
+    fn tick(&mut self) {
+        let Some(s) = self.sink.as_ref() else {
+            return;
+        };
 
-    let ended = s.empty();
-    let pos = s.get_pos().as_secs_f64();
-    let paused = s.is_paused();
+        let ended = s.empty();
+        let pos = s.get_pos().as_secs_f64();
+        let paused = s.is_paused();
 
-    {
-        let mut st = state.lock().unwrap();
         if ended {
+            if self.index + 1 < self.queue.len() {
+                self.start_at(self.index + 1);
+                return;
+            }
+            let mut st = self.state.lock().unwrap();
             st.playing = false;
             st.ended = true;
+            st.has_next = false;
             if st.duration_secs > 0.0 {
                 st.position_secs = st.duration_secs;
             }
-        } else {
+            return;
+        }
+
+        {
+            let mut st = self.state.lock().unwrap();
             st.position_secs = pos;
             st.playing = !paused;
             st.ended = false;
         }
+
+        if self.last_push.elapsed() >= Duration::from_millis(1000) {
+            if let Some(c) = self.controls.as_mut() {
+                let progress = Some(MediaPosition(Duration::from_secs_f64(pos)));
+                let playback = if paused {
+                    MediaPlayback::Paused { progress }
+                } else {
+                    MediaPlayback::Playing { progress }
+                };
+                let _ = c.set_playback(playback);
+            }
+            self.last_push = Instant::now();
+        }
     }
 
-    if last_progress_push.elapsed() >= Duration::from_millis(1000) {
-        if let Some(c) = controls.as_mut() {
+    fn push_playback(&mut self, playing: bool) {
+        let pos = self.state.lock().unwrap().position_secs;
+        if let Some(c) = self.controls.as_mut() {
             let progress = Some(MediaPosition(Duration::from_secs_f64(pos)));
-            let playback = if ended || paused {
-                MediaPlayback::Paused { progress }
-            } else {
+            let playback = if playing {
                 MediaPlayback::Playing { progress }
+            } else {
+                MediaPlayback::Paused { progress }
             };
             let _ = c.set_playback(playback);
         }
-        *last_progress_push = Instant::now();
-    }
-}
-
-fn set_playing(state: &Arc<Mutex<PlayerState>>, playing: bool) {
-    state.lock().unwrap().playing = playing;
-}
-
-fn set_control_playback(
-    controls: &mut Option<MediaControls>,
-    state: &Arc<Mutex<PlayerState>>,
-    playing: bool,
-) {
-    if let Some(c) = controls.as_mut() {
-        let pos = state.lock().unwrap().position_secs;
-        let progress = Some(MediaPosition(Duration::from_secs_f64(pos)));
-        let playback = if playing {
-            MediaPlayback::Playing { progress }
-        } else {
-            MediaPlayback::Paused { progress }
-        };
-        let _ = c.set_playback(playback);
     }
 }
 
@@ -283,6 +338,8 @@ fn make_controls(tx: Sender<Cmd>) -> Option<MediaControls> {
             MediaControlEvent::Play => Some(Cmd::Resume),
             MediaControlEvent::Pause => Some(Cmd::Pause),
             MediaControlEvent::Toggle => Some(Cmd::Toggle),
+            MediaControlEvent::Next => Some(Cmd::Next),
+            MediaControlEvent::Previous => Some(Cmd::Prev),
             MediaControlEvent::Stop => Some(Cmd::Stop),
             MediaControlEvent::SetPosition(MediaPosition(d)) => Some(Cmd::SeekTo(d.as_secs_f64())),
             _ => None,
@@ -457,11 +514,7 @@ impl Iterator for StreamingSource {
 impl Source for StreamingSource {
     fn current_frame_len(&self) -> Option<usize> {
         let left = self.local.len().saturating_sub(self.lpos);
-        if left > 0 {
-            Some(left)
-        } else {
-            None
-        }
+        if left > 0 { Some(left) } else { None }
     }
 
     fn channels(&self) -> u16 {
@@ -524,7 +577,9 @@ fn build_source(client: &reqwest::blocking::Client, url: &str) -> Result<Streami
     let sample_rate = params.sample_rate.unwrap_or(44_100);
     let channels = params.channels.map(|c| c.count() as u16).unwrap_or(2);
     let total = match (params.n_frames, params.sample_rate) {
-        (Some(frames), Some(sr)) if sr > 0 => Some(Duration::from_secs_f64(frames as f64 / sr as f64)),
+        (Some(frames), Some(sr)) if sr > 0 => {
+            Some(Duration::from_secs_f64(frames as f64 / sr as f64))
+        }
         _ => None,
     };
 

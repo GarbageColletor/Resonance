@@ -5,14 +5,13 @@ pub mod subsonic;
 use std::sync::Mutex;
 
 use audio::{AudioHandle, Cmd, PlayerState};
-use subsonic::{Song, Subsonic};
+use subsonic::{Album, Artist, Song, Subsonic};
 
 const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../resonance.dev.json");
 
 struct AppState {
     sub: Mutex<Option<Subsonic>>,
     audio: AudioHandle,
-    last: Mutex<Option<(String, Song)>>,
 }
 
 #[derive(serde::Serialize)]
@@ -20,62 +19,87 @@ struct ConnectInfo {
     server: String,
     version: String,
     artist_count: usize,
-    artists_sample: Vec<String>,
-}
-
-#[derive(serde::Serialize)]
-struct SongDto {
-    id: String,
-    title: String,
-    artist: Option<String>,
-    album: Option<String>,
-    duration_secs: Option<u64>,
 }
 
 #[tauri::command]
 fn connect(state: tauri::State<AppState>) -> Result<ConnectInfo, String> {
     let sub = Subsonic::from_dev_config(DEV_CONFIG).map_err(|e| e.to_string())?;
     let version = sub.ping().map_err(|e| e.to_string())?;
-    let (artist_count, artists_sample) = sub.artists().map_err(|e| e.to_string())?;
+    let artists = sub.artists_full().map_err(|e| e.to_string())?;
     let server = sub.base.clone();
+    let artist_count = artists.len();
     *state.sub.lock().unwrap() = Some(sub);
     Ok(ConnectInfo {
         server,
         version,
         artist_count,
-        artists_sample,
     })
 }
 
 #[tauri::command]
-fn play_random(state: tauri::State<AppState>) -> Result<SongDto, String> {
+fn list_artists(state: tauri::State<AppState>) -> Result<Vec<Artist>, String> {
     let guard = state.sub.lock().unwrap();
-    let sub = guard.as_ref().ok_or("conéctate primero")?;
-    let song = sub.random_song().map_err(|e| e.to_string())?;
-    let url = sub.stream_url(&song.id);
-    let dto = SongDto {
-        id: song.id.clone(),
-        title: song.title.clone(),
-        artist: song.artist.clone(),
-        album: song.album.clone(),
-        duration_secs: song.duration_secs,
-    };
-    *state.last.lock().unwrap() = Some((url.clone(), song.clone()));
-    state.audio.send(Cmd::Play { url, song });
-    Ok(dto)
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.artists_full().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn replay(state: tauri::State<AppState>) -> Result<(), String> {
-    let (url, song) = state
-        .last
-        .lock()
-        .unwrap()
-        .as_ref()
-        .ok_or("no hay pista para repetir")?
-        .clone();
-    state.audio.send(Cmd::Play { url, song });
+fn list_albums(state: tauri::State<AppState>, artist_id: String) -> Result<Vec<Album>, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.artist_albums(&artist_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_album_tracks(state: tauri::State<AppState>, album_id: String) -> Result<Vec<Song>, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.album_tracks(&album_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn play_album(state: tauri::State<AppState>, album_id: String, start: usize) -> Result<(), String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    let tracks = sub.album_tracks(&album_id).map_err(|e| e.to_string())?;
+    if tracks.is_empty() {
+        return Err("album sin pistas".into());
+    }
+    let items: Vec<(String, Song)> = tracks
+        .into_iter()
+        .map(|s| (sub.stream_url(&s.id), s))
+        .collect();
+    state.audio.send(Cmd::PlayQueue { items, start });
     Ok(())
+}
+
+#[tauri::command]
+fn play_random(state: tauri::State<AppState>) -> Result<Song, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    let song = sub.random_song().map_err(|e| e.to_string())?;
+    let url = sub.stream_url(&song.id);
+    let out = song.clone();
+    state.audio.send(Cmd::PlayQueue {
+        items: vec![(url, song)],
+        start: 0,
+    });
+    Ok(out)
+}
+
+#[tauri::command]
+fn next_track(state: tauri::State<AppState>) {
+    state.audio.send(Cmd::Next);
+}
+
+#[tauri::command]
+fn prev_track(state: tauri::State<AppState>) {
+    state.audio.send(Cmd::Prev);
+}
+
+#[tauri::command]
+fn replay(state: tauri::State<AppState>) {
+    state.audio.send(Cmd::Replay);
 }
 
 #[tauri::command]
@@ -103,7 +127,6 @@ pub fn run() {
     let app_state = AppState {
         sub: Mutex::new(None),
         audio: AudioHandle::spawn(),
-        last: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -111,7 +134,13 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             connect,
+            list_artists,
+            list_albums,
+            list_album_tracks,
+            play_album,
             play_random,
+            next_track,
+            prev_track,
             replay,
             toggle_play,
             seek,

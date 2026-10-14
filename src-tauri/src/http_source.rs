@@ -1,9 +1,9 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
+use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT_RANGES, CONTENT_RANGE, RANGE};
-use reqwest::StatusCode;
 
 pub struct HttpStream {
     client: Client,
@@ -71,13 +71,7 @@ impl Read for HttpStream {
         if self.reader.get_mut().unwrap().is_none() {
             self.open_at(self.pos)?;
         }
-        let n = self
-            .reader
-            .get_mut()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read(buf)?;
+        let n = self.reader.get_mut().unwrap().as_mut().unwrap().read(buf)?;
         self.pos += n as u64;
         Ok(n)
     }
@@ -103,16 +97,16 @@ impl symphonia::core::io::MediaSource for HttpStream {
         self.accepts_ranges
     }
     fn byte_len(&self) -> Option<u64> {
-        if self.len > 0 {
-            Some(self.len)
-        } else {
-            None
-        }
+        if self.len > 0 { Some(self.len) } else { None }
     }
 }
 
 fn total_len(resp: &Response) -> u64 {
-    if let Some(cr) = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(cr) = resp
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(total) = cr.rsplit('/').next() {
             if let Ok(n) = total.trim().parse::<u64>() {
                 return n;

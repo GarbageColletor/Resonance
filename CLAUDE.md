@@ -10,15 +10,23 @@ The full design spec lives in `docs/` (written in Spanish) and is the source of 
 
 ## Current state
 
-Working against a real Navidrome: connect with token auth, browse artists then albums then album tracks, play an album as a queue with auto-advance and next/previous, seek over HTTP streaming, replay, play a random track, and OS media keys (including next/previous via MPRIS). The code is still flat (not yet in the doc-04 layout):
+Resonance runs as a real player against a real Navidrome. Implemented:
 
-- `src/App.tsx`, `src/App.css` : React UI. `App` owns connection and library browsing; `BrowseList` (memoized) renders the artist/album/track list; `PlayerBar` (memoized) owns the player-state poll and transport controls. The two are isolated so the ~250ms poll only re-renders the small player bar, not the list. Albums-by-artist and tracks-by-album are cached; navigation is optimistic (view switches first, shows "Cargando").
-- `src-tauri/src/subsonic.rs` : OpenSubsonic client (token auth, ping, getArtists, getArtist, getAlbum, getRandomSongs, stream URL).
-- `src-tauri/src/http_source.rs` : `HttpStream`, a `Read + Seek` source over HTTP range requests, also a Symphonia `MediaSource`.
-- `src-tauri/src/audio.rs` : native audio service. `Engine` owns the play queue (Vec of (url, Song) plus index) with auto-advance and next/previous, runs on its own thread with a command queue; `SampleQueue` plus a producer thread decode ahead into a bounded ring buffer that the Rodio `Source` drains without blocking; `souvlaki` for media keys.
-- `src-tauri/src/lib.rs` : Tauri state and commands (connect, list_artists, list_albums, list_album_tracks, play_album, play_random, next_track, prev_track, replay, toggle_play, seek, set_volume, player_state).
+- Connection wizard: the user enters server URL, username and password in the UI. URL and username are saved to `~/.config/resonance/server.json`; the password goes to the OS keychain (Secret Service via the `keyring` crate), never to disk in plaintext (NFR-03). On launch the app auto-reconnects from the saved server; "Cambiar servidor" forgets it. Connection errors are classified (bad credentials vs network vs TLS).
+- Library: browse artists then albums then album tracks; search (search3) across artists/albums/songs; playlists (getPlaylists/getPlaylist) and favorites (getStarred2) as top-level tabs; cover art (getCoverArt) in lists and the player bar.
+- Playback: native audio queue with auto-advance, next/previous, replay, seek over HTTP streaming, play album / play a song list / play random. OS media keys via MPRIS including next/previous.
+- Session persistence (FR-09): the engine saves the queue (songs and ids, no stream URLs) plus a small playhead (index + position) to the config dir; on reconnect the queue is restored paused at the saved position, with the token-bearing URLs rebuilt fresh. Password and stream tokens are never written to disk.
 
-Stack in use: Tauri 2, React 19, TypeScript, Vite, Rust. Audio is Symphonia + Rodio + CPAL + souvlaki. Stream URLs carry Subsonic token auth and do not expire within the session, so a whole album's URLs are prebuilt in the command layer and handed to the audio thread, which advances the queue without needing credentials. SQLite and secure credential storage are planned but not added yet (dev credentials live in `resonance.dev.json`).
+The code is still flat (not yet in the doc-04 layout):
+
+- `src/App.tsx`, `src/App.css` : React UI. `App` owns connection, the connection form, library browsing and the tab switcher (Artistas / Playlists / Favoritos). `BrowseList`, `SearchResultsView`, `SongList` and `Cover` are separate components; `PlayerBar` (memoized, no props) owns the ~250ms player-state poll and transport controls, isolated so the poll does not re-render the lists. Albums-by-artist and tracks-by-album are cached; navigation is optimistic.
+- `src-tauri/src/subsonic.rs` : OpenSubsonic client (`Subsonic::new(url, user, password)`, token auth; ping, getArtists, getArtist, getAlbum, getRandomSongs, getPlaylists, getPlaylist, getStarred2, search3, and stream / getCoverArt URL builders).
+- `src-tauri/src/http_source.rs` : `HttpStream`, a `Read + Seek` source over HTTP range requests, also a Symphonia `MediaSource` (real `byte_len` + `is_seekable`).
+- `src-tauri/src/audio.rs` : native audio service. `Engine` owns the play queue with auto-advance / next / previous / replay and session save/restore, on its own thread with a command queue; `SampleQueue` plus a producer thread decode ahead into a bounded ring buffer that `StreamingSource` (a Rodio `Source`) drains without blocking; `souvlaki` for media keys.
+- `src-tauri/src/store.rs` : non-secret config (`server.json`), generic blob read/write for the session and playhead files, and the keyring wrapper for the password.
+- `src-tauri/src/lib.rs` : Tauri state, error classification, session restore, and the commands (saved_server, connect_server, connect_saved, forget_server, list_artists, list_albums, list_album_tracks, list_playlists, playlist_tracks, list_starred, search, play_album, play_songs, play_random, next_track, prev_track, replay, toggle_play, seek, set_volume, player_state).
+
+Stack in use: Tauri 2, React 19, TypeScript, Vite, Rust. Audio is Symphonia + Rodio + CPAL + souvlaki; credentials via `keyring`; config dir via `dirs`. Stream URLs carry Subsonic token auth and do not expire within the session, so a whole album's URLs are prebuilt in the command layer and handed to the audio thread, which advances the queue without needing credentials. SQLite is not used yet; a JSON config/session store covers current needs.
 
 ## Target architecture (what the code should grow into)
 
@@ -47,13 +55,19 @@ Deliberate decisions from the spec. Writing the "obvious" code instead is the ma
 - Secrets go in the OS keychain/vault; SQLite stores only references (`secret_ref`), never plaintext credentials.
 - HTTPS by default. HTTP (LAN) requires an explicit user warning flow; never silently accept TLS errors.
 
-## Audio findings (Milestone 0)
+## Audio findings
 
-- Decode with Symphonia directly, not `rodio::Decoder`. Rodio 0.20's `ReadSeekSource` hardcodes `byte_len() = None`, which makes Symphonia report FLAC as `Unseekable`. `HttpStream` wrapped as a Symphonia `MediaSource` returning `byte_len = Some(len)` and `is_seekable = true` seeks correctly. Rodio is used only as the output sink via a custom `Source` (`SymphoniaSource`) whose `try_seek` drives the Symphonia format reader. Decoding ourselves is also what will later give the PCM tap for the FFT visualizer and the EQ/DSP chain.
+- Decode with Symphonia directly, not `rodio::Decoder`. Rodio 0.20's `ReadSeekSource` hardcodes `byte_len() = None`, which makes Symphonia report FLAC as `Unseekable`. `HttpStream` wrapped as a Symphonia `MediaSource` returning `byte_len = Some(len)` and `is_seekable = true` seeks correctly. Rodio is used only as the output sink via a custom `Source` (`StreamingSource`) whose `try_seek` drives the Symphonia format reader. Decoding ourselves is also what will later give the PCM tap for the FFT visualizer and the EQ/DSP chain.
+- Streaming and decode run on a producer thread that fills a bounded sample ring buffer (`SampleQueue`); `StreamingSource` only drains memory, so the audio output thread never blocks on the network. This fixed the earlier ALSA underruns.
 - Navidrome's `stream` endpoint honors range requests (`Accept-Ranges: bytes`), so no temp-file buffering is needed.
 - OS media controls (MPRIS/SMTC/Now Playing) are not provided by Rodio/CPAL; `souvlaki` handles them.
 - Server is all-FLAC, so Opus (Symphonia's weak spot) is a non-issue for now.
-- Known debt: `SymphoniaSource::next()` does blocking HTTP reads on Rodio's audio output thread, so an empty buffer (notably right after a seek) causes occasional ALSA underruns. The fix is a producer thread that decodes ahead into a bounded ring buffer the Rodio `Source` drains without blocking.
+
+## Known gaps
+
+- Output stream resilience (NFR-05): the `OutputStream` is created once and never recreated, so if the ALSA/CPAL stream dies (`alsa::poll()` POLLERR, e.g. the audio device changes, or the CPU is starved such as by a full `cargo build` during playback) the app goes silent until restart. Recreating the stream on error is not implemented. Note: do not run heavy rebuilds while audio is playing in dev; it can trigger POLLERR via starvation.
+- Secret scrubbing in error strings: `classify_error` maps common connect failures to generic messages, but the fallback returns the raw error, which for a reqwest error can include the request URL (with token). Scrub the URL/token from any error surfaced to the UI or logs (ties to the invariant about keeping sensitive URLs out of logs).
+- Keyring depends on a running Secret Service (gnome-keyring/KWallet). If absent, saving the password fails gracefully (logged, non-fatal) and the user re-enters it each launch; auto-reconnect then cannot run.
 
 ## Conventions
 
@@ -67,7 +81,8 @@ Deliberate decisions from the spec. Writing the "obvious" code instead is the ma
 
 - `npm run app` launches the Tauri desktop app (Vite plus Rust). Use this, not `npm run tauri dev`, on Linux: it sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, without which WebKitGTK crashes on Wayland with `Gdk-Message: Error 71 (protocol error) dispatching to Wayland display`. This is a WebKitGTK/Wayland environment issue, not an app bug.
 - First Rust build is slow (Symphonia/CPAL/reqwest); later builds are incremental.
-- Dev credentials live in `resonance.dev.json` at the repo root (gitignored). Copy `resonance.dev.example.json` to create it.
+- Credentials are entered in the app's connection wizard and saved to `~/.config/resonance/server.json` (URL + username) plus the OS keychain (password). The old `resonance.dev.json` is no longer used by the app.
+- Avoid repeated full rebuilds while the app is playing audio: the dev watcher restarts the binary (killing playback) and the compile can starve the audio thread into a POLLERR.
 
 ## Git
 

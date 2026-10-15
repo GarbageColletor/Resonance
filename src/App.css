@@ -299,6 +299,23 @@ input[type="range"] {
     justify-content: center;
 }
 
+.modes {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+}
+
+.mode {
+    font-size: 13px;
+    padding: 6px 12px;
+    color: var(--text-muted);
+}
+
+.mode.active {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
 button {
     background: var(--surface-raised);
     color: var(--text-primary);

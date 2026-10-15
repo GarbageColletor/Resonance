@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rodio::source::SeekError;
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
@@ -42,12 +42,39 @@ pub struct Playhead {
     pub position_secs: f64,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::All,
+            RepeatMode::All => RepeatMode::One,
+            RepeatMode::One => RepeatMode::Off,
+        }
+    }
+}
+
 #[derive(Clone, Default, serde::Serialize)]
 pub struct PlayerState {
     pub playing: bool,
     pub ended: bool,
     pub has_next: bool,
     pub has_prev: bool,
+    pub shuffle: bool,
+    pub repeat: String,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub current_id: Option<String>,
@@ -76,6 +103,8 @@ pub enum Cmd {
     SeekTo(f64),
     Stop,
     SetVolume(f32),
+    ToggleShuffle,
+    CycleRepeat,
 }
 
 #[derive(Clone)]
@@ -127,7 +156,11 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         controls: make_controls(tx_self),
         sink: None,
         queue: Vec::new(),
+        order: Vec::new(),
+        cursor: 0,
         index: 0,
+        shuffle: false,
+        repeat: RepeatMode::Off,
         volume: 1.0,
         last_push: Instant::now(),
         last_save: Instant::now(),
@@ -150,7 +183,11 @@ struct Engine {
     controls: Option<MediaControls>,
     sink: Option<Sink>,
     queue: Vec<(String, Song)>,
+    order: Vec<usize>,
+    cursor: usize,
     index: usize,
+    shuffle: bool,
+    repeat: RepeatMode,
     volume: f32,
     last_push: Instant,
     last_save: Instant,
@@ -165,7 +202,8 @@ impl Engine {
                 }
                 self.queue = items;
                 let start = start.min(self.queue.len() - 1);
-                self.start_at(start);
+                self.build_order(start);
+                self.play_cursor(self.cursor, true, 0.0);
                 self.save_queue();
             }
             Cmd::LoadQueuePaused {
@@ -178,23 +216,36 @@ impl Engine {
                 }
                 self.queue = items;
                 let idx = index.min(self.queue.len() - 1);
-                self.start_at_opts(idx, false, position_secs);
+                self.build_order(idx);
+                self.play_cursor(self.cursor, false, position_secs);
                 self.save_queue();
             }
             Cmd::Next => {
-                if self.index + 1 < self.queue.len() {
-                    self.start_at(self.index + 1);
+                if let Some(c) = self.next_cursor() {
+                    self.play_cursor(c, true, 0.0);
                 }
             }
             Cmd::Prev => {
-                if self.index > 0 {
-                    self.start_at(self.index - 1);
+                if let Some(c) = self.prev_cursor() {
+                    self.play_cursor(c, true, 0.0);
                 }
             }
             Cmd::Replay => {
-                if !self.queue.is_empty() {
-                    self.start_at(self.index);
+                if !self.order.is_empty() {
+                    self.play_cursor(self.cursor, true, 0.0);
                 }
+            }
+            Cmd::ToggleShuffle => {
+                self.shuffle = !self.shuffle;
+                if !self.queue.is_empty() {
+                    self.build_order(self.index);
+                }
+                self.update_nav_state();
+                self.save_playhead();
+            }
+            Cmd::CycleRepeat => {
+                self.repeat = self.repeat.next();
+                self.update_nav_state();
             }
             Cmd::Pause => {
                 if let Some(s) = self.sink.as_ref() {
@@ -251,10 +302,6 @@ impl Engine {
         }
     }
 
-    fn start_at(&mut self, idx: usize) {
-        self.start_at_opts(idx, true, 0.0);
-    }
-
     fn start_at_opts(&mut self, idx: usize, autoplay: bool, seek_to: f64) {
         if idx >= self.queue.len() {
             return;
@@ -293,9 +340,8 @@ impl Engine {
                     st.artist = song.artist.clone();
                     st.album = song.album.clone();
                     st.cover_url = song.cover_url.clone();
-                    st.has_next = idx + 1 < self.queue.len();
-                    st.has_prev = idx > 0;
                 }
+                self.update_nav_state();
 
                 if let Some(c) = self.controls.as_mut() {
                     let _ = c.set_metadata(MediaMetadata {
@@ -352,6 +398,68 @@ impl Engine {
         self.last_save = Instant::now();
     }
 
+    fn build_order(&mut self, start_index: usize) {
+        let n = self.queue.len();
+        if n == 0 {
+            self.order.clear();
+            self.cursor = 0;
+            return;
+        }
+        let start = start_index.min(n - 1);
+        if self.shuffle {
+            let mut rest: Vec<usize> = (0..n).filter(|&i| i != start).collect();
+            shuffle_in_place(&mut rest);
+            self.order = std::iter::once(start).chain(rest).collect();
+            self.cursor = 0;
+        } else {
+            self.order = (0..n).collect();
+            self.cursor = start;
+        }
+    }
+
+    fn play_cursor(&mut self, cursor: usize, autoplay: bool, seek_to: f64) {
+        if cursor >= self.order.len() {
+            return;
+        }
+        self.cursor = cursor;
+        let idx = self.order[cursor];
+        self.start_at_opts(idx, autoplay, seek_to);
+    }
+
+    fn next_cursor(&self) -> Option<usize> {
+        if self.order.is_empty() {
+            return None;
+        }
+        if self.cursor + 1 < self.order.len() {
+            Some(self.cursor + 1)
+        } else if self.repeat == RepeatMode::All {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn prev_cursor(&self) -> Option<usize> {
+        if self.order.is_empty() {
+            return None;
+        }
+        if self.cursor > 0 {
+            Some(self.cursor - 1)
+        } else if self.repeat == RepeatMode::All {
+            Some(self.order.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    fn update_nav_state(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.has_next = self.cursor + 1 < self.order.len() || self.repeat == RepeatMode::All;
+        st.has_prev = self.cursor > 0 || self.repeat == RepeatMode::All;
+        st.shuffle = self.shuffle;
+        st.repeat = self.repeat.as_str().to_string();
+    }
+
     fn tick(&mut self) {
         let Some(s) = self.sink.as_ref() else {
             return;
@@ -362,9 +470,15 @@ impl Engine {
         let paused = s.is_paused();
 
         if ended {
-            if self.index + 1 < self.queue.len() {
-                self.start_at(self.index + 1);
-                return;
+            if !self.order.is_empty() {
+                if self.repeat == RepeatMode::One {
+                    self.play_cursor(self.cursor, true, 0.0);
+                    return;
+                }
+                if let Some(c) = self.next_cursor() {
+                    self.play_cursor(c, true, 0.0);
+                    return;
+                }
             }
             let mut st = self.state.lock().unwrap();
             st.playing = false;
@@ -412,6 +526,24 @@ impl Engine {
             };
             let _ = c.set_playback(playback);
         }
+    }
+}
+
+fn shuffle_in_place(v: &mut [usize]) {
+    if v.len() < 2 {
+        return;
+    }
+    let mut state = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        | 1;
+    for i in (1..v.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        v.swap(i, j);
     }
 }
 

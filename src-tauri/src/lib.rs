@@ -267,6 +267,16 @@ fn set_volume(state: tauri::State<AppState>, volume: f32) {
 }
 
 #[tauri::command]
+fn toggle_shuffle(state: tauri::State<AppState>) {
+    state.audio.send(Cmd::ToggleShuffle);
+}
+
+#[tauri::command]
+fn cycle_repeat(state: tauri::State<AppState>) {
+    state.audio.send(Cmd::CycleRepeat);
+}
+
+#[tauri::command]
 fn player_state(state: tauri::State<AppState>) -> PlayerState {
     state.audio.snapshot()
 }
@@ -302,6 +312,8 @@ pub fn run() {
             toggle_play,
             seek,
             set_volume,
+            toggle_shuffle,
+            cycle_repeat,
             player_state
         ])
         .run(tauri::generate_context!())

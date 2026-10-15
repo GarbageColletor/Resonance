@@ -50,6 +50,8 @@ type PlayerState = {
     ended: boolean;
     has_next: boolean;
     has_prev: boolean;
+    shuffle: boolean;
+    repeat: string;
     position_secs: number;
     duration_secs: number;
     current_id: string | null;
@@ -248,6 +250,25 @@ const PlayerBar = memo(function PlayerBar() {
                 </button>
                 <button onClick={() => skip("next_track")} disabled={!player.has_next}>
                     Siguiente
+                </button>
+            </div>
+
+            <div className="modes">
+                <button
+                    className={player.shuffle ? "mode active" : "mode"}
+                    onClick={() => invoke("toggle_shuffle")}
+                >
+                    Aleatorio
+                </button>
+                <button
+                    className={player.repeat !== "off" ? "mode active" : "mode"}
+                    onClick={() => invoke("cycle_repeat")}
+                >
+                    {player.repeat === "one"
+                        ? "Repetir: una"
+                        : player.repeat === "all"
+                            ? "Repetir: todo"
+                            : "Repetir"}
                 </button>
             </div>
         </section>

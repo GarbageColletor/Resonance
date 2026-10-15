@@ -24,3 +24,5 @@ docs
 *.njsproj
 *.sln
 *.sw?
+
+.codex/

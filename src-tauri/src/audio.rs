@@ -136,6 +136,7 @@ impl AudioHandle {
 }
 
 fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerState>>) {
+    silence_alsa_logging();
     let (stream, handle) = match OutputStream::try_default() {
         Ok(x) => x,
         Err(e) => {
@@ -340,6 +341,8 @@ impl Engine {
                 }
                 self.sink = Some(new_sink);
                 self.index = idx;
+                self.frozen_ticks = 0;
+                self.last_pos = seek_to;
 
                 {
                     let mut st = self.state.lock().unwrap();
@@ -536,7 +539,7 @@ impl Engine {
                 self.frozen_ticks = 0;
             }
             self.last_pos = pos;
-            if self.frozen_ticks >= 6 && self.last_recover.elapsed() >= Duration::from_secs(2) {
+            if self.frozen_ticks >= 4 && self.last_recover.elapsed() >= Duration::from_secs(2) {
                 self.frozen_ticks = 0;
                 self.recover_output(pos);
                 return;
@@ -584,6 +587,34 @@ impl Engine {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn silence_alsa_logging() {
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" fn quiet(
+        _file: *const c_char,
+        _line: c_int,
+        _function: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+    ) {
+    }
+
+    #[link(name = "asound")]
+    unsafe extern "C" {
+        fn snd_lib_error_set_handler(
+            handler: extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char),
+        ) -> c_int;
+    }
+
+    unsafe {
+        snd_lib_error_set_handler(quiet);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn silence_alsa_logging() {}
 
 fn shuffle_in_place(v: &mut [usize]) {
     if v.len() < 2 {

@@ -117,5 +117,5 @@ fn total_len(resp: &Response) -> u64 {
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::new(io::ErrorKind::Other, crate::subsonic::scrub(&e.to_string()))
 }

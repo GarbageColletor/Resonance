@@ -555,12 +555,14 @@ export default function App() {
                     >
                         <input
                             type="text"
+                            aria-label="URL del servidor"
                             placeholder="https://tu-servidor"
                             value={serverUrl}
                             onChange={(e) => setServerUrl(e.target.value)}
                         />
                         <input
                             type="text"
+                            aria-label="Usuario"
                             placeholder="Usuario"
                             autoComplete="username"
                             value={username}
@@ -568,6 +570,7 @@ export default function App() {
                         />
                         <input
                             type="password"
+                            aria-label="Contrasena"
                             placeholder="Contrasena"
                             autoComplete="current-password"
                             value={password}
@@ -618,6 +621,7 @@ export default function App() {
                             <input
                                 className="search"
                                 type="text"
+                                aria-label="Buscar"
                                 placeholder="Buscar artistas, albumes, canciones..."
                                 value={query}
                                 onChange={(e) => setQuery(e.target.value)}

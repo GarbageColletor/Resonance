@@ -136,7 +136,7 @@ impl AudioHandle {
 }
 
 fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerState>>) {
-    let (_stream, handle) = match OutputStream::try_default() {
+    let (stream, handle) = match OutputStream::try_default() {
         Ok(x) => x,
         Err(e) => {
             eprintln!("[audio] sin dispositivo de salida: {e}");
@@ -150,7 +150,8 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         .expect("http client");
 
     let mut engine = Engine {
-        handle,
+        _stream: Some(stream),
+        handle: Some(handle),
         client,
         state,
         controls: make_controls(tx_self),
@@ -164,6 +165,9 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         volume: 1.0,
         last_push: Instant::now(),
         last_save: Instant::now(),
+        last_pos: 0.0,
+        frozen_ticks: 0,
+        last_recover: Instant::now(),
     };
 
     loop {
@@ -177,7 +181,8 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
 }
 
 struct Engine {
-    handle: OutputStreamHandle,
+    _stream: Option<OutputStream>,
+    handle: Option<OutputStreamHandle>,
     client: reqwest::blocking::Client,
     state: Arc<Mutex<PlayerState>>,
     controls: Option<MediaControls>,
@@ -191,6 +196,9 @@ struct Engine {
     volume: f32,
     last_push: Instant,
     last_save: Instant,
+    last_pos: f64,
+    frozen_ticks: u32,
+    last_recover: Instant,
 }
 
 impl Engine {
@@ -307,9 +315,13 @@ impl Engine {
             return;
         }
         let (url, song) = self.queue[idx].clone();
+        let handle = match self.handle.as_ref() {
+            Some(h) => h.clone(),
+            None => return,
+        };
         match build_source(&self.client, &url) {
             Ok(source) => {
-                let new_sink = match Sink::try_new(&self.handle) {
+                let new_sink = match Sink::try_new(&handle) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("[audio] no pude crear sink: {e}");
@@ -460,7 +472,34 @@ impl Engine {
         st.repeat = self.repeat.as_str().to_string();
     }
 
+    fn recover_output(&mut self, resume_pos: f64) {
+        eprintln!("[audio] salida de audio congelada; recreando OutputStream");
+        self.sink = None;
+        self._stream = None;
+        self.handle = None;
+        self.frozen_ticks = 0;
+        self.last_recover = Instant::now();
+        match OutputStream::try_default() {
+            Ok((stream, handle)) => {
+                self._stream = Some(stream);
+                self.handle = Some(handle);
+                if !self.order.is_empty() {
+                    self.play_cursor(self.cursor, true, resume_pos);
+                }
+            }
+            Err(e) => eprintln!("[audio] no pude recrear la salida: {e}"),
+        }
+    }
+
     fn tick(&mut self) {
+        if self.handle.is_none() {
+            if !self.order.is_empty() && self.last_recover.elapsed() >= Duration::from_secs(2) {
+                let pos = self.state.lock().unwrap().position_secs;
+                self.recover_output(pos);
+            }
+            return;
+        }
+
         let Some(s) = self.sink.as_ref() else {
             return;
         };
@@ -488,6 +527,23 @@ impl Engine {
                 st.position_secs = st.duration_secs;
             }
             return;
+        }
+
+        if !paused {
+            if (pos - self.last_pos).abs() < 0.01 {
+                self.frozen_ticks += 1;
+            } else {
+                self.frozen_ticks = 0;
+            }
+            self.last_pos = pos;
+            if self.frozen_ticks >= 6 && self.last_recover.elapsed() >= Duration::from_secs(2) {
+                self.frozen_ticks = 0;
+                self.recover_output(pos);
+                return;
+            }
+        } else {
+            self.frozen_ticks = 0;
+            self.last_pos = pos;
         }
 
         {

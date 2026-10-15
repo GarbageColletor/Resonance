@@ -283,7 +283,33 @@ impl Subsonic {
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::new(io::ErrorKind::Other, scrub(&e.to_string()))
+}
+
+pub fn scrub(s: &str) -> String {
+    let mut out = s.to_string();
+    for base in ["u", "t", "s", "p", "apiKey", "password"] {
+        for pre in ['?', '&'] {
+            out = redact_param(&out, &format!("{pre}{base}="));
+        }
+    }
+    out
+}
+
+fn redact_param(s: &str, key: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(key) {
+        result.push_str(&rest[..pos + key.len()]);
+        let after = &rest[pos + key.len()..];
+        let end = after
+            .find(|c: char| matches!(c, '&' | ' ' | ')' | '"' | '\''))
+            .unwrap_or(after.len());
+        result.push_str("REDACTED");
+        rest = &after[end..];
+    }
+    result.push_str(rest);
+    result
 }
 
 fn url_encode(s: &str) -> String {

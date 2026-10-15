@@ -10,15 +10,15 @@ The full design spec lives in `docs/` (written in Spanish) and is the source of 
 
 ## Current state
 
-Past the Milestone 0 spike ("connect and play"), validated in the running app against a real Navidrome: connect with token auth, browse artist count, stream a FLAC, native playback, seek over HTTP streaming, and OS media keys. The code is still flat (not yet in the doc-04 layout):
+Working against a real Navidrome: connect with token auth, browse artists then albums then album tracks, play an album as a queue with auto-advance and next/previous, seek over HTTP streaming, replay, play a random track, and OS media keys (including next/previous via MPRIS). The code is still flat (not yet in the doc-04 layout):
 
-- `src/App.tsx`, `src/App.css` : minimal React UI (connect, play a random track, play/pause, seek bar).
-- `src-tauri/src/subsonic.rs` : minimal OpenSubsonic client (token auth, ping, getArtists, getRandomSongs, stream URL).
+- `src/App.tsx`, `src/App.css` : React UI. `App` owns connection and library browsing; `BrowseList` (memoized) renders the artist/album/track list; `PlayerBar` (memoized) owns the player-state poll and transport controls. The two are isolated so the ~250ms poll only re-renders the small player bar, not the list. Albums-by-artist and tracks-by-album are cached; navigation is optimistic (view switches first, shows "Cargando").
+- `src-tauri/src/subsonic.rs` : OpenSubsonic client (token auth, ping, getArtists, getArtist, getAlbum, getRandomSongs, stream URL).
 - `src-tauri/src/http_source.rs` : `HttpStream`, a `Read + Seek` source over HTTP range requests, also a Symphonia `MediaSource`.
-- `src-tauri/src/audio.rs` : native audio service (Symphonia decode plus Rodio/CPAL output) on its own thread with a command queue; `souvlaki` for media keys.
-- `src-tauri/src/lib.rs` : Tauri state and commands.
+- `src-tauri/src/audio.rs` : native audio service. `Engine` owns the play queue (Vec of (url, Song) plus index) with auto-advance and next/previous, runs on its own thread with a command queue; `SampleQueue` plus a producer thread decode ahead into a bounded ring buffer that the Rodio `Source` drains without blocking; `souvlaki` for media keys.
+- `src-tauri/src/lib.rs` : Tauri state and commands (connect, list_artists, list_albums, list_album_tracks, play_album, play_random, next_track, prev_track, replay, toggle_play, seek, set_volume, player_state).
 
-Stack in use: Tauri 2, React 19, TypeScript, Vite, Rust. Audio is Symphonia + Rodio + CPAL + souvlaki. SQLite is planned but not added yet.
+Stack in use: Tauri 2, React 19, TypeScript, Vite, Rust. Audio is Symphonia + Rodio + CPAL + souvlaki. Stream URLs carry Subsonic token auth and do not expire within the session, so a whole album's URLs are prebuilt in the command layer and handed to the audio thread, which advances the queue without needing credentials. SQLite and secure credential storage are planned but not added yet (dev credentials live in `resonance.dev.json`).
 
 ## Target architecture (what the code should grow into)
 

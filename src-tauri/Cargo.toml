@@ -23,12 +23,13 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Audio nativo + protocolo (spike Milestone 0)
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 rodio = { version = "0.20", features = ["symphonia-flac"] }
 symphonia = { version = "0.5", default-features = false, features = ["flac"] }
 souvlaki = "0.7"
 md5 = "0.7"
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+dirs = "5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

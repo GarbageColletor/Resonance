@@ -1,13 +1,12 @@
 pub mod audio;
 pub mod http_source;
+pub mod store;
 pub mod subsonic;
 
 use std::sync::Mutex;
 
-use audio::{AudioHandle, Cmd, PlayerState};
-use subsonic::{Album, Artist, Song, Subsonic};
-
-const DEV_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../resonance.dev.json");
+use audio::{AudioHandle, Cmd, Playhead, PlayerState, SessionSnapshot};
+use subsonic::{Album, Artist, Playlist, SearchResults, Song, Subsonic};
 
 struct AppState {
     sub: Mutex<Option<Subsonic>>,
@@ -21,19 +20,122 @@ struct ConnectInfo {
     artist_count: usize,
 }
 
-#[tauri::command]
-fn connect(state: tauri::State<AppState>) -> Result<ConnectInfo, String> {
-    let sub = Subsonic::from_dev_config(DEV_CONFIG).map_err(|e| e.to_string())?;
-    let version = sub.ping().map_err(|e| e.to_string())?;
+#[derive(serde::Serialize)]
+struct SavedServerInfo {
+    url: String,
+    username: String,
+}
+
+fn classify_error(e: std::io::Error) -> String {
+    let low = e.to_string().to_lowercase();
+    if low.contains("subsonic error") {
+        "El servidor rechazo las credenciales".to_string()
+    } else if low.contains("certificate") || low.contains("tls") || low.contains("ssl") {
+        "Error de certificado TLS del servidor".to_string()
+    } else if low.contains("dns")
+        || low.contains("connect")
+        || low.contains("tim")
+        || low.contains("resolve")
+    {
+        "No pude conectar con el servidor (revisa la URL y la red)".to_string()
+    } else {
+        e.to_string()
+    }
+}
+
+fn restore_session(sub: &Subsonic, audio: &AudioHandle) {
+    let Some(bytes) = store::load_blob("session.json") else {
+        return;
+    };
+    let Ok(snap) = serde_json::from_slice::<SessionSnapshot>(&bytes) else {
+        return;
+    };
+    if snap.songs.is_empty() {
+        return;
+    }
+    let items: Vec<(String, Song)> = snap
+        .songs
+        .iter()
+        .map(|s| (sub.stream_url(&s.id), s.clone()))
+        .collect();
+    let (mut index, mut position_secs) = (snap.index, snap.position_secs);
+    if let Some(hbytes) = store::load_blob("playhead.json") {
+        if let Ok(head) = serde_json::from_slice::<Playhead>(&hbytes) {
+            index = head.index;
+            position_secs = head.position_secs;
+        }
+    }
+    let index = index.min(items.len() - 1);
+    if snap.volume > 0.0 {
+        audio.send(Cmd::SetVolume(snap.volume));
+    }
+    audio.send(Cmd::LoadQueuePaused {
+        items,
+        index,
+        position_secs,
+    });
+}
+
+fn open(sub: Subsonic) -> Result<(Subsonic, ConnectInfo), String> {
+    let version = sub.ping().map_err(classify_error)?;
     let artists = sub.artists_full().map_err(|e| e.to_string())?;
-    let server = sub.base.clone();
-    let artist_count = artists.len();
-    *state.sub.lock().unwrap() = Some(sub);
-    Ok(ConnectInfo {
-        server,
+    let info = ConnectInfo {
+        server: sub.base.clone(),
         version,
-        artist_count,
+        artist_count: artists.len(),
+    };
+    Ok((sub, info))
+}
+
+#[tauri::command]
+fn saved_server() -> Option<SavedServerInfo> {
+    store::load_server().map(|s| SavedServerInfo {
+        url: s.url,
+        username: s.username,
     })
+}
+
+#[tauri::command]
+fn connect_server(
+    state: tauri::State<AppState>,
+    url: String,
+    username: String,
+    password: String,
+    remember: bool,
+) -> Result<ConnectInfo, String> {
+    let sub = Subsonic::new(&url, &username, &password).map_err(|e| e.to_string())?;
+    let (sub, info) = open(sub)?;
+    if remember {
+        store::save_server(&info.server, &username).map_err(|e| e.to_string())?;
+        if let Err(e) = store::save_password(&username, &password) {
+            eprintln!("[store] no pude guardar la contrasena en el llavero: {e}");
+        }
+    }
+    *state.sub.lock().unwrap() = Some(sub);
+    Ok(info)
+}
+
+#[tauri::command]
+fn connect_saved(state: tauri::State<AppState>) -> Result<ConnectInfo, String> {
+    let saved = store::load_server().ok_or("no hay servidor guardado")?;
+    let password =
+        store::load_password(&saved.username).ok_or("no hay contrasena guardada en el llavero")?;
+    let sub = Subsonic::new(&saved.url, &saved.username, &password).map_err(|e| e.to_string())?;
+    let (sub, info) = open(sub)?;
+    restore_session(&sub, &state.audio);
+    *state.sub.lock().unwrap() = Some(sub);
+    Ok(info)
+}
+
+#[tauri::command]
+fn forget_server(state: tauri::State<AppState>) -> Result<(), String> {
+    if let Some(s) = store::load_server() {
+        store::clear_password(&s.username);
+    }
+    store::clear_server().map_err(|e| e.to_string())?;
+    state.audio.send(Cmd::Stop);
+    *state.sub.lock().unwrap() = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -66,6 +168,53 @@ fn play_album(state: tauri::State<AppState>, album_id: String, start: usize) -> 
         return Err("album sin pistas".into());
     }
     let items: Vec<(String, Song)> = tracks
+        .into_iter()
+        .map(|s| (sub.stream_url(&s.id), s))
+        .collect();
+    state.audio.send(Cmd::PlayQueue { items, start });
+    Ok(())
+}
+
+#[tauri::command]
+fn list_playlists(state: tauri::State<AppState>) -> Result<Vec<Playlist>, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.playlists().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn playlist_tracks(state: tauri::State<AppState>, playlist_id: String) -> Result<Vec<Song>, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.playlist_tracks(&playlist_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_starred(state: tauri::State<AppState>) -> Result<Vec<Song>, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.starred_songs().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn search(state: tauri::State<AppState>, query: String) -> Result<SearchResults, String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.search(&query).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn play_songs(
+    state: tauri::State<AppState>,
+    songs: Vec<Song>,
+    start: usize,
+) -> Result<(), String> {
+    if songs.is_empty() {
+        return Err("sin pistas".into());
+    }
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    let items: Vec<(String, Song)> = songs
         .into_iter()
         .map(|s| (sub.stream_url(&s.id), s))
         .collect();
@@ -133,11 +282,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
-            connect,
+            saved_server,
+            connect_server,
+            connect_saved,
+            forget_server,
             list_artists,
             list_albums,
             list_album_tracks,
+            list_playlists,
+            playlist_tracks,
+            list_starred,
+            search,
             play_album,
+            play_songs,
             play_random,
             next_track,
             prev_track,

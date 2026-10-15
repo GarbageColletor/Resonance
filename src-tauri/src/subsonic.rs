@@ -2,15 +2,6 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-pub struct DevConfig {
-    #[serde(rename = "serverUrl")]
-    pub server_url: String,
-    pub username: String,
-    pub password: String,
-}
 
 pub struct Subsonic {
     pub base: String,
@@ -19,14 +10,27 @@ pub struct Subsonic {
     pub client: Client,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Song {
     pub id: String,
     pub title: String,
+    #[serde(default)]
     pub artist: Option<String>,
+    #[serde(default)]
     pub album: Option<String>,
+    #[serde(default)]
     pub suffix: Option<String>,
+    #[serde(default)]
     pub duration_secs: Option<u64>,
+    #[serde(default)]
+    pub cover_url: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResults {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub songs: Vec<Song>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -34,6 +38,7 @@ pub struct Artist {
     pub id: String,
     pub name: String,
     pub album_count: Option<u64>,
+    pub cover_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,23 +48,29 @@ pub struct Album {
     pub artist: Option<String>,
     pub year: Option<u64>,
     pub song_count: Option<u64>,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    pub song_count: Option<u64>,
+    pub cover_url: Option<String>,
 }
 
 impl Subsonic {
-    pub fn from_dev_config(path: &str) -> io::Result<Self> {
-        let data = std::fs::read(path)?;
-        let cfg: DevConfig = serde_json::from_slice(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    pub fn new(base_url: &str, username: &str, password: &str) -> io::Result<Self> {
         let client = Client::builder()
             .user_agent("resonance/0.1")
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(to_io)?;
-        let base = cfg.server_url.trim_end_matches('/').to_string();
         Ok(Self {
-            base,
-            user: cfg.username,
-            password: cfg.password,
+            base: base_url.trim_end_matches('/').to_string(),
+            user: username.to_string(),
+            password: password.to_string(),
             client,
         })
     }
@@ -115,25 +126,6 @@ impl Subsonic {
             .to_string())
     }
 
-    pub fn artists(&self) -> io::Result<(usize, Vec<String>)> {
-        let v = self.get_json("getArtists", "")?;
-        let mut names = Vec::new();
-        if let Some(index) = v["subsonic-response"]["artists"]["index"].as_array() {
-            for idx in index {
-                if let Some(arr) = idx["artist"].as_array() {
-                    for a in arr {
-                        if let Some(n) = a["name"].as_str() {
-                            names.push(n.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        let count = names.len();
-        names.truncate(5);
-        Ok((count, names))
-    }
-
     pub fn random_song(&self) -> io::Result<Song> {
         let v = self.get_json("getRandomSongs", "size=1")?;
         let s = &v["subsonic-response"]["randomSongs"]["song"][0];
@@ -143,7 +135,7 @@ impl Subsonic {
                 "getRandomSongs no devolvio canciones",
             ));
         }
-        Ok(song_from(s))
+        Ok(self.parse_song(s))
     }
 
     pub fn artists_full(&self) -> io::Result<Vec<Artist>> {
@@ -152,15 +144,7 @@ impl Subsonic {
         if let Some(index) = v["subsonic-response"]["artists"]["index"].as_array() {
             for idx in index {
                 if let Some(arr) = idx["artist"].as_array() {
-                    for a in arr {
-                        if let Some(id) = a["id"].as_str() {
-                            out.push(Artist {
-                                id: id.to_string(),
-                                name: a["name"].as_str().unwrap_or("(sin nombre)").to_string(),
-                                album_count: a["albumCount"].as_u64(),
-                            });
-                        }
-                    }
+                    out.extend(arr.iter().filter_map(|a| self.parse_artist(a)));
                 }
             }
         }
@@ -171,17 +155,7 @@ impl Subsonic {
         let v = self.get_json("getArtist", &format!("id={}", url_encode(id)))?;
         let mut out = Vec::new();
         if let Some(arr) = v["subsonic-response"]["artist"]["album"].as_array() {
-            for a in arr {
-                if let Some(aid) = a["id"].as_str() {
-                    out.push(Album {
-                        id: aid.to_string(),
-                        name: a["name"].as_str().unwrap_or("(sin titulo)").to_string(),
-                        artist: a["artist"].as_str().map(str::to_string),
-                        year: a["year"].as_u64(),
-                        song_count: a["songCount"].as_u64(),
-                    });
-                }
-            }
+            out.extend(arr.iter().filter_map(|a| self.parse_album(a)));
         }
         Ok(out)
     }
@@ -191,7 +165,73 @@ impl Subsonic {
         let mut out = Vec::new();
         if let Some(arr) = v["subsonic-response"]["album"]["song"].as_array() {
             for s in arr {
-                out.push(song_from(s));
+                out.push(self.parse_song(s));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn search(&self, query: &str) -> io::Result<SearchResults> {
+        let extra = format!(
+            "query={}&artistCount=20&albumCount=20&songCount=50",
+            url_encode(query)
+        );
+        let v = self.get_json("search3", &extra)?;
+        let r = &v["subsonic-response"]["searchResult3"];
+        let artists = r["artist"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| self.parse_artist(x)).collect())
+            .unwrap_or_default();
+        let albums = r["album"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| self.parse_album(x)).collect())
+            .unwrap_or_default();
+        let songs = r["song"]
+            .as_array()
+            .map(|a| a.iter().map(|x| self.parse_song(x)).collect())
+            .unwrap_or_default();
+        Ok(SearchResults {
+            artists,
+            albums,
+            songs,
+        })
+    }
+
+    pub fn playlists(&self) -> io::Result<Vec<Playlist>> {
+        let v = self.get_json("getPlaylists", "")?;
+        let mut out = Vec::new();
+        if let Some(arr) = v["subsonic-response"]["playlists"]["playlist"].as_array() {
+            for p in arr {
+                if let Some(id) = p["id"].as_str() {
+                    out.push(Playlist {
+                        id: id.to_string(),
+                        name: p["name"].as_str().unwrap_or("(sin nombre)").to_string(),
+                        song_count: p["songCount"].as_u64(),
+                        cover_url: self.cover_url(p),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn playlist_tracks(&self, id: &str) -> io::Result<Vec<Song>> {
+        let v = self.get_json("getPlaylist", &format!("id={}", url_encode(id)))?;
+        let mut out = Vec::new();
+        if let Some(arr) = v["subsonic-response"]["playlist"]["entry"].as_array() {
+            for s in arr {
+                out.push(self.parse_song(s));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn starred_songs(&self) -> io::Result<Vec<Song>> {
+        let v = self.get_json("getStarred2", "")?;
+        let mut out = Vec::new();
+        if let Some(arr) = v["subsonic-response"]["starred2"]["song"].as_array() {
+            for s in arr {
+                out.push(self.parse_song(s));
             }
         }
         Ok(out)
@@ -200,16 +240,45 @@ impl Subsonic {
     pub fn stream_url(&self, id: &str) -> String {
         self.rest_url("stream", &format!("id={}", url_encode(id)))
     }
-}
 
-fn song_from(s: &serde_json::Value) -> Song {
-    Song {
-        id: s["id"].as_str().unwrap_or("").to_string(),
-        title: s["title"].as_str().unwrap_or("(sin titulo)").to_string(),
-        artist: s["artist"].as_str().map(str::to_string),
-        album: s["album"].as_str().map(str::to_string),
-        suffix: s["suffix"].as_str().map(str::to_string),
-        duration_secs: s["duration"].as_u64(),
+    fn cover_url(&self, v: &serde_json::Value) -> Option<String> {
+        v["coverArt"].as_str().map(|cid| {
+            self.rest_url("getCoverArt", &format!("id={}&size=256", url_encode(cid)))
+        })
+    }
+
+    fn parse_artist(&self, a: &serde_json::Value) -> Option<Artist> {
+        let id = a["id"].as_str()?;
+        Some(Artist {
+            id: id.to_string(),
+            name: a["name"].as_str().unwrap_or("(sin nombre)").to_string(),
+            album_count: a["albumCount"].as_u64(),
+            cover_url: self.cover_url(a),
+        })
+    }
+
+    fn parse_album(&self, a: &serde_json::Value) -> Option<Album> {
+        let id = a["id"].as_str()?;
+        Some(Album {
+            id: id.to_string(),
+            name: a["name"].as_str().unwrap_or("(sin titulo)").to_string(),
+            artist: a["artist"].as_str().map(str::to_string),
+            year: a["year"].as_u64(),
+            song_count: a["songCount"].as_u64(),
+            cover_url: self.cover_url(a),
+        })
+    }
+
+    fn parse_song(&self, s: &serde_json::Value) -> Song {
+        Song {
+            id: s["id"].as_str().unwrap_or("").to_string(),
+            title: s["title"].as_str().unwrap_or("(sin titulo)").to_string(),
+            artist: s["artist"].as_str().map(str::to_string),
+            album: s["album"].as_str().map(str::to_string),
+            suffix: s["suffix"].as_str().map(str::to_string),
+            duration_secs: s["duration"].as_u64(),
+            cover_url: self.cover_url(s),
+        }
     }
 }
 

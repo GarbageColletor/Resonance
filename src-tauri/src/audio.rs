@@ -20,10 +20,27 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::http_source::HttpStream;
+use crate::store;
 use crate::subsonic::Song;
 
 const QUEUE_CAP: usize = 44_100 * 2 * 4;
 const DRAIN_CHUNK: usize = 4096;
+const SESSION_FILE: &str = "session.json";
+const PLAYHEAD_FILE: &str = "playhead.json";
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct SessionSnapshot {
+    pub songs: Vec<Song>,
+    pub index: usize,
+    pub position_secs: f64,
+    pub volume: f32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct Playhead {
+    pub index: usize,
+    pub position_secs: f64,
+}
 
 #[derive(Clone, Default, serde::Serialize)]
 pub struct PlayerState {
@@ -37,12 +54,18 @@ pub struct PlayerState {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub cover_url: Option<String>,
 }
 
 pub enum Cmd {
     PlayQueue {
         items: Vec<(String, Song)>,
         start: usize,
+    },
+    LoadQueuePaused {
+        items: Vec<(String, Song)>,
+        index: usize,
+        position_secs: f64,
     },
     Next,
     Prev,
@@ -107,6 +130,7 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         index: 0,
         volume: 1.0,
         last_push: Instant::now(),
+        last_save: Instant::now(),
     };
 
     loop {
@@ -129,6 +153,7 @@ struct Engine {
     index: usize,
     volume: f32,
     last_push: Instant,
+    last_save: Instant,
 }
 
 impl Engine {
@@ -141,6 +166,20 @@ impl Engine {
                 self.queue = items;
                 let start = start.min(self.queue.len() - 1);
                 self.start_at(start);
+                self.save_queue();
+            }
+            Cmd::LoadQueuePaused {
+                items,
+                index,
+                position_secs,
+            } => {
+                if items.is_empty() {
+                    return;
+                }
+                self.queue = items;
+                let idx = index.min(self.queue.len() - 1);
+                self.start_at_opts(idx, false, position_secs);
+                self.save_queue();
             }
             Cmd::Next => {
                 if self.index + 1 < self.queue.len() {
@@ -197,6 +236,8 @@ impl Engine {
                 self.queue.clear();
                 self.index = 0;
                 *self.state.lock().unwrap() = PlayerState::default();
+                store::clear_blob(SESSION_FILE);
+                store::clear_blob(PLAYHEAD_FILE);
                 if let Some(c) = self.controls.as_mut() {
                     let _ = c.set_playback(MediaPlayback::Stopped);
                 }
@@ -211,6 +252,10 @@ impl Engine {
     }
 
     fn start_at(&mut self, idx: usize) {
+        self.start_at_opts(idx, true, 0.0);
+    }
+
+    fn start_at_opts(&mut self, idx: usize, autoplay: bool, seek_to: f64) {
         if idx >= self.queue.len() {
             return;
         }
@@ -226,20 +271,28 @@ impl Engine {
                 };
                 new_sink.set_volume(self.volume);
                 new_sink.append(source);
-                new_sink.play();
+                if autoplay {
+                    new_sink.play();
+                } else {
+                    new_sink.pause();
+                }
+                if seek_to > 0.0 {
+                    let _ = new_sink.try_seek(Duration::from_secs_f64(seek_to));
+                }
                 self.sink = Some(new_sink);
                 self.index = idx;
 
                 {
                     let mut st = self.state.lock().unwrap();
-                    st.playing = true;
+                    st.playing = autoplay;
                     st.ended = false;
-                    st.position_secs = 0.0;
+                    st.position_secs = seek_to;
                     st.duration_secs = song.duration_secs.unwrap_or(0) as f64;
                     st.current_id = Some(song.id.clone());
                     st.title = Some(song.title.clone());
                     st.artist = song.artist.clone();
                     st.album = song.album.clone();
+                    st.cover_url = song.cover_url.clone();
                     st.has_next = idx + 1 < self.queue.len();
                     st.has_prev = idx > 0;
                 }
@@ -252,13 +305,51 @@ impl Engine {
                         cover_url: None,
                         duration: song.duration_secs.map(Duration::from_secs),
                     });
-                    let _ = c.set_playback(MediaPlayback::Playing {
-                        progress: Some(MediaPosition(Duration::ZERO)),
-                    });
+                    let progress = Some(MediaPosition(Duration::from_secs_f64(seek_to)));
+                    let playback = if autoplay {
+                        MediaPlayback::Playing { progress }
+                    } else {
+                        MediaPlayback::Paused { progress }
+                    };
+                    let _ = c.set_playback(playback);
                 }
+
+                self.save_playhead();
             }
             Err(e) => eprintln!("[audio] fallo al abrir {}: {e}", song.title),
         }
+    }
+
+    fn save_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let position_secs = self.state.lock().unwrap().position_secs;
+        let snap = SessionSnapshot {
+            songs: self.queue.iter().map(|(_, s)| s.clone()).collect(),
+            index: self.index,
+            position_secs,
+            volume: self.volume,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&snap) {
+            let _ = store::save_blob(SESSION_FILE, &bytes);
+        }
+        self.save_playhead();
+    }
+
+    fn save_playhead(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let position_secs = self.state.lock().unwrap().position_secs;
+        let head = Playhead {
+            index: self.index,
+            position_secs,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&head) {
+            let _ = store::save_blob(PLAYHEAD_FILE, &bytes);
+        }
+        self.last_save = Instant::now();
     }
 
     fn tick(&mut self) {
@@ -303,6 +394,10 @@ impl Engine {
                 let _ = c.set_playback(playback);
             }
             self.last_push = Instant::now();
+        }
+
+        if self.last_save.elapsed() >= Duration::from_secs(3) {
+            self.save_playhead();
         }
     }
 

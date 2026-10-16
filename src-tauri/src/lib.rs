@@ -58,16 +58,19 @@ fn restore_session(sub: &Subsonic, audio: &AudioHandle) {
         .iter()
         .map(|s| (sub.stream_url(&s.id), s.clone()))
         .collect();
-    let (mut index, mut position_secs) = (snap.index, snap.position_secs);
+    let (mut index, mut position_secs, mut volume) = (snap.index, snap.position_secs, snap.volume);
     if let Some(hbytes) = store::load_blob("playhead.json") {
         if let Ok(head) = serde_json::from_slice::<Playhead>(&hbytes) {
             index = head.index;
             position_secs = head.position_secs;
+            if head.volume > 0.0 {
+                volume = head.volume;
+            }
         }
     }
     let index = index.min(items.len() - 1);
-    if snap.volume > 0.0 {
-        audio.send(Cmd::SetVolume(snap.volume));
+    if volume > 0.0 {
+        audio.send(Cmd::SetVolume(volume));
     }
     audio.send(Cmd::LoadQueuePaused {
         items,
@@ -197,6 +200,13 @@ fn list_starred(state: tauri::State<AppState>) -> Result<Vec<Song>, String> {
 }
 
 #[tauri::command]
+fn set_star(state: tauri::State<AppState>, id: String, starred: bool) -> Result<(), String> {
+    let guard = state.sub.lock().unwrap();
+    let sub = guard.as_ref().ok_or("conectate primero")?;
+    sub.set_star(&id, starred).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn search(state: tauri::State<AppState>, query: String) -> Result<SearchResults, String> {
     let guard = state.sub.lock().unwrap();
     let sub = guard.as_ref().ok_or("conectate primero")?;
@@ -302,6 +312,7 @@ pub fn run() {
             list_playlists,
             playlist_tracks,
             list_starred,
+            set_star,
             search,
             play_album,
             play_songs,

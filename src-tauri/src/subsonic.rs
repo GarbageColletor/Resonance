@@ -24,6 +24,8 @@ pub struct Song {
     pub duration_secs: Option<u64>,
     #[serde(default)]
     pub cover_url: Option<String>,
+    #[serde(default)]
+    pub starred: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -278,7 +280,14 @@ impl Subsonic {
             suffix: s["suffix"].as_str().map(str::to_string),
             duration_secs: s["duration"].as_u64(),
             cover_url: self.cover_url(s),
+            starred: !s["starred"].is_null(),
         }
+    }
+
+    pub fn set_star(&self, id: &str, starred: bool) -> io::Result<()> {
+        let method = if starred { "star" } else { "unstar" };
+        self.get_json(method, &format!("id={}", url_encode(id)))?;
+        Ok(())
     }
 }
 

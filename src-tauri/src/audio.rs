@@ -40,6 +40,8 @@ pub struct SessionSnapshot {
 pub struct Playhead {
     pub index: usize,
     pub position_secs: f64,
+    #[serde(default)]
+    pub volume: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -82,6 +84,7 @@ pub struct PlayerState {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub cover_url: Option<String>,
+    pub volume: f32,
 }
 
 pub enum Cmd {
@@ -167,7 +170,7 @@ fn run_audio(rx: Receiver<Cmd>, tx_self: Sender<Cmd>, state: Arc<Mutex<PlayerSta
         last_push: Instant::now(),
         last_save: Instant::now(),
         last_pos: 0.0,
-        frozen_ticks: 0,
+        last_pos_change: Instant::now(),
         last_recover: Instant::now(),
     };
 
@@ -198,7 +201,7 @@ struct Engine {
     last_push: Instant,
     last_save: Instant,
     last_pos: f64,
-    frozen_ticks: u32,
+    last_pos_change: Instant,
     last_recover: Instant,
 }
 
@@ -307,6 +310,7 @@ impl Engine {
                 if let Some(s) = self.sink.as_ref() {
                     s.set_volume(self.volume);
                 }
+                self.state.lock().unwrap().volume = self.volume;
             }
         }
     }
@@ -341,8 +345,8 @@ impl Engine {
                 }
                 self.sink = Some(new_sink);
                 self.index = idx;
-                self.frozen_ticks = 0;
                 self.last_pos = seek_to;
+                self.last_pos_change = Instant::now();
 
                 {
                     let mut st = self.state.lock().unwrap();
@@ -406,6 +410,7 @@ impl Engine {
         let head = Playhead {
             index: self.index,
             position_secs,
+            volume: self.volume,
         };
         if let Ok(bytes) = serde_json::to_vec(&head) {
             let _ = store::save_blob(PLAYHEAD_FILE, &bytes);
@@ -473,6 +478,7 @@ impl Engine {
         st.has_prev = self.cursor > 0 || self.repeat == RepeatMode::All;
         st.shuffle = self.shuffle;
         st.repeat = self.repeat.as_str().to_string();
+        st.volume = self.volume;
     }
 
     fn recover_output(&mut self, resume_pos: f64) {
@@ -480,7 +486,7 @@ impl Engine {
         self.sink = None;
         self._stream = None;
         self.handle = None;
-        self.frozen_ticks = 0;
+        self.last_pos_change = Instant::now();
         self.last_recover = Instant::now();
         match OutputStream::try_default() {
             Ok((stream, handle)) => {
@@ -533,20 +539,18 @@ impl Engine {
         }
 
         if !paused {
-            if (pos - self.last_pos).abs() < 0.01 {
-                self.frozen_ticks += 1;
-            } else {
-                self.frozen_ticks = 0;
-            }
-            self.last_pos = pos;
-            if self.frozen_ticks >= 4 && self.last_recover.elapsed() >= Duration::from_secs(2) {
-                self.frozen_ticks = 0;
+            if (pos - self.last_pos).abs() >= 0.05 {
+                self.last_pos = pos;
+                self.last_pos_change = Instant::now();
+            } else if self.last_pos_change.elapsed() >= Duration::from_millis(1500)
+                && self.last_recover.elapsed() >= Duration::from_secs(2)
+            {
                 self.recover_output(pos);
                 return;
             }
         } else {
-            self.frozen_ticks = 0;
             self.last_pos = pos;
+            self.last_pos_change = Instant::now();
         }
 
         {
